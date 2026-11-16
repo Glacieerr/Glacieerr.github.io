@@ -1,0 +1,125 @@
+# Builds my interactive homepage from the public profile repository (Glacieerr/Glacieerr, pages/)
+# and publishes it here with GitHub Pages. No personal token is needed: the source is public, and
+# this repository's own GITHUB_TOKEN may publish this repository's Pages site.
+#
+# When: by hand (Actions > Build and publish > Run workflow), on every push here, and once a night.
+# A nightly run publishes only when the profile repository's main branch has moved since the last
+# publish (the site keeps the commit it was built from in deployed-from.txt), so most nights it
+# stops after a few seconds.
+#
+# What: the same checks as the profile repository's "Interactive page" workflow: every stated fact
+# against data/facts.json, the clock and the sky at the edges of time, and every check of the page
+# in headless Chrome (one retry). Nothing is published when one of them fails (idea #125).
+#
+# Settings > Pages > Source must be "GitHub Actions".
+name: Build and publish
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "47 6 * * *"        # 01:47 in New York in winter, 02:47 in summer
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # Which commit of the profile repository to build, and whether tonight there is anything new.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.which.outputs.sha }}
+      build: ${{ steps.which.outputs.build }}
+    steps:
+      - id: which
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          sha=$(git ls-remote https://github.com/Glacieerr/Glacieerr.git refs/heads/main | cut -f1)
+          [ -n "$sha" ] || { echo "::error::could not read the main branch of Glacieerr/Glacieerr"; exit 1; }
+          live=$(curl -fsS --max-time 20 https://glacieerr.github.io/deployed-from.txt 2>/dev/null | tr -d '[:space:]' || true)
+          build=true
+          if [ "$EVENT" = "schedule" ] && [ "$live" = "$sha" ]; then build=false; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "profile main: $sha; the site was built from: ${live:-unknown}; build now: $build"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    # a run of the page checks takes about 11 minutes on a Mac and maybe half as long again here,
+    # and a failed run is tried once more
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Glacieerr/Glacieerr
+          ref: ${{ needs.check.outputs.sha }}
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: "Facts: every date, version, count and name matches data/facts.json (idea #183)"
+        run: python3 scripts/fact_check.py --repo-only --self-test
+
+      - name: "Time edge cases: DST changes, a leap day, the turn of the year (idea #177)"
+        run: node scripts/time_tests.mjs
+
+      - name: Fonts for the Chinese copy (the page shows both languages)
+        continue-on-error: true
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: Build the page and run every check (headless Chrome, one retry)
+        env:
+          CHROME: ${{ github.workspace }}/scripts/chrome-ci.sh
+          CHROME_PROFILE_ROOT: ${{ runner.temp }}
+          WATCHDOG: "900000"
+        run: node scripts/pages_tests.mjs
+
+      - name: Collect the page and the files next to it
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          bash scripts/collect_site.sh "$RUNNER_TEMP/site"
+          echo "$SHA" > "$RUNNER_TEMP/site/deployed-from.txt"
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  keepalive:
+    # GitHub switches off a public repository's scheduled workflows after 60 days without activity,
+    # and this repository rarely gets a commit, so each nightly run switches this workflow on again
+    # (the same approach as the profile repository's monthly workflow, idea #124).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/publish.yml/enable"
